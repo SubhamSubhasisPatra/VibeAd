@@ -20,7 +20,7 @@ from typing import Deque, List, Optional
 
 import numpy as np
 import sounddevice as sd
-import whisper
+from faster_whisper import WhisperModel
 from pynput import keyboard
 
 
@@ -145,8 +145,8 @@ class WhisperHotkeyDictation:
             target=self._transcription_worker, name="transcription-worker", daemon=True
         )
 
-        print(f"[model] loading OpenAI Whisper model '{config.model}'...")
-        self.model = whisper.load_model(config.model)
+        print(f"[model] loading faster-whisper model '{config.model}'...")
+        self.model = WhisperModel(config.model, device="auto", compute_type="int8")
         print("[model] ready")
 
     @staticmethod
@@ -209,15 +209,16 @@ class WhisperHotkeyDictation:
                 self._reset_segment_state_locked()
 
     def _transcribe_chunk(self, audio: np.ndarray) -> str:
-        result = self.model.transcribe(
-            audio=audio,
+        segments, _ = self.model.transcribe(
+            audio,
             language=self.config.language,
             task="transcribe",
-            fp16=False,
+            beam_size=1,
+            vad_filter=True,
             temperature=0.0,
             condition_on_previous_text=False,
         )
-        return (result.get("text") or "").strip()
+        return " ".join(s.text for s in segments).strip()
 
     def _type_text(self, text: str) -> None:
         if not text:

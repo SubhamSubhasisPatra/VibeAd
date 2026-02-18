@@ -1,4 +1,4 @@
 numpy>=1.24
-openai-whisper
+faster-whisper>=1.0.0
 pynput>=1.7.7
 sounddevice>=0.4.6
