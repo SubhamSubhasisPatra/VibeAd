@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Global hotkey dictation using OpenAI Whisper - near real-time via rolling window.
+"""Global hotkey dictation using OpenAI Whisper with rolling near-live updates.
 
-Inspired by collabora/WhisperLive: instead of waiting for silence, audio is
-accumulated into a rolling buffer and transcribed every second. Whisper returns
-multiple segments; all but the last are considered "complete" and typed immediately.
-The last segment is held back until Whisper stops changing it (same-output guard).
+While dictation is ON:
+- audio is appended into a rolling buffer;
+- a background worker transcribes only the unconfirmed tail every interval;
+- confirmed segments are typed immediately;
+- on pause, the current partial segment is force-flushed.
 """
 
 from __future__ import annotations
@@ -13,8 +14,9 @@ import argparse
 import platform
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Deque, List, Optional, Tuple
 
 import numpy as np
 import sounddevice as sd
@@ -22,21 +24,47 @@ import whisper
 from pynput import keyboard
 
 
-# ---------------------------------------------------------------------------
-# Hotkey helpers (unchanged)
-# ---------------------------------------------------------------------------
-
 def normalize_hotkey(hotkey: str) -> str:
     aliases = {
-        "control": "ctrl", "option": "alt", "command": "cmd",
-        "return": "enter", "escape": "esc", "spacebar": "space",
+        "control": "ctrl",
+        "option": "alt",
+        "command": "cmd",
+        "return": "enter",
+        "escape": "esc",
+        "spacebar": "space",
     }
     named_keys = {
-        "alt", "alt_l", "alt_r", "backspace", "caps_lock", "cmd", "cmd_l",
-        "cmd_r", "ctrl", "ctrl_l", "ctrl_r", "delete", "down", "end",
-        "enter", "esc", "home", "insert", "left", "menu", "page_down",
-        "page_up", "right", "shift", "shift_l", "shift_r", "space", "tab", "up",
+        "alt",
+        "alt_l",
+        "alt_r",
+        "backspace",
+        "caps_lock",
+        "cmd",
+        "cmd_l",
+        "cmd_r",
+        "ctrl",
+        "ctrl_l",
+        "ctrl_r",
+        "delete",
+        "down",
+        "end",
+        "enter",
+        "esc",
+        "home",
+        "insert",
+        "left",
+        "menu",
+        "page_down",
+        "page_up",
+        "right",
+        "shift",
+        "shift_l",
+        "shift_r",
+        "space",
+        "tab",
+        "up",
     }
+
     parts: List[str] = []
     for raw in hotkey.split("+"):
         part = raw.strip()
@@ -65,17 +93,13 @@ def validate_hotkey(hotkey: str) -> str:
 
 
 def platform_default_hotkey() -> str:
-    s = platform.system().lower()
-    if s == "darwin":
+    system_name = platform.system().lower()
+    if system_name == "darwin":
         return "<cmd>+<shift>+g"
-    if s == "windows":
+    if system_name == "windows":
         return "<alt>+<ctrl>+<shift>+m"
     return "<ctrl>+<alt>+<space>"
 
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
 
 @dataclass
 class DictationConfig:
@@ -83,213 +107,308 @@ class DictationConfig:
     model: str
     language: Optional[str]
     sample_rate: int
-    block_duration: float   # audio callback chunk size in seconds
-    no_speech_thresh: float # discard segments with no_speech_prob above this
-    same_out_limit: int     # repeat count before forcing a partial segment out
-    max_buffer_secs: float  # rolling buffer max length before trimming
+    block_duration: float
+    live_interval: float
+    min_chunk_secs: float
+    pause_silence_secs: float
+    trailing_silence_secs: float
+    silence_threshold_db: float
+    no_speech_thresh: float
+    same_out_limit: int
+    max_buffer_secs: float
+    trim_secs: float
     device: Optional[int]
 
 
-# ---------------------------------------------------------------------------
-# Main class
-# ---------------------------------------------------------------------------
-
 class WhisperHotkeyDictation:
-    TRIM_SECS = 10  # how much to trim when buffer gets too long
-
     def __init__(self, config: DictationConfig) -> None:
         self.config = config
         self.enabled = threading.Event()
         self.stopping = threading.Event()
         self.lock = threading.Lock()
+        self.transcribe_lock = threading.Lock()
 
-        # Rolling audio buffer (collabora/WhisperLive style)
-        self.frames_np: Optional[np.ndarray] = None
-        self.frames_offset = 0.0    # seconds that have been trimmed off the front
-        self.timestamp_offset = 0.0 # seconds of audio confirmed as transcribed
+        self.buffer_chunks: Deque[np.ndarray] = deque()
+        self.buffer_samples = 0
+        self.buffer_start_time = 0.0
+        self.timestamp_offset = 0.0
+        self.last_voice_ts = 0.0
 
-        # Same-output guard: if Whisper emits the same last segment N times in a
-        # row, treat it as confirmed and type it.
         self.prev_out = ""
         self.same_out_count = 0
-        self.end_time_for_same_out: Optional[float] = None
 
         self.keyboard_controller = keyboard.Controller()
         self.worker = threading.Thread(
-            target=self._transcription_worker, name="transcription-worker", daemon=True
+            target=self._transcription_worker,
+            name="transcription-worker",
+            daemon=True,
         )
 
-        print(f"[model] loading Whisper model '{config.model}'...")
+        print(f"[model] loading OpenAI Whisper model '{config.model}'...")
         self.model = whisper.load_model(config.model)
         print("[model] ready")
 
-    # ------------------------------------------------------------------
-    # Audio callback – just fill the rolling buffer
-    # ------------------------------------------------------------------
+    @staticmethod
+    def _chunk_db(chunk: np.ndarray) -> float:
+        rms = float(np.sqrt(np.mean(chunk * chunk) + 1e-12))
+        return 20.0 * np.log10(rms + 1e-12)
+
+    def _drop_oldest_samples_locked(self, samples_to_drop: int) -> None:
+        remaining = samples_to_drop
+        while remaining > 0 and self.buffer_chunks:
+            head = self.buffer_chunks[0]
+            head_len = len(head)
+            if head_len <= remaining:
+                self.buffer_chunks.popleft()
+                self.buffer_samples -= head_len
+                self.buffer_start_time += head_len / float(self.config.sample_rate)
+                remaining -= head_len
+            else:
+                self.buffer_chunks[0] = head[remaining:]
+                self.buffer_samples -= remaining
+                self.buffer_start_time += remaining / float(self.config.sample_rate)
+                remaining = 0
+
+        if self.timestamp_offset < self.buffer_start_time:
+            self.timestamp_offset = self.buffer_start_time
 
     def _audio_callback(self, indata: np.ndarray, frames: int, t, status) -> None:
+        del frames, t
         if status:
             print(f"[audio] {status}", flush=True)
         if not self.enabled.is_set() or self.stopping.is_set():
             return
 
         mono = np.asarray(indata[:, 0], dtype=np.float32).copy()
+        voiced = self._chunk_db(mono) >= self.config.silence_threshold_db
+
         max_samples = int(self.config.max_buffer_secs * self.config.sample_rate)
-        trim_samples = int(self.TRIM_SECS * self.config.sample_rate)
+        trim_samples = int(self.config.trim_secs * self.config.sample_rate)
+        now = time.monotonic()
 
         with self.lock:
-            if self.frames_np is None:
-                self.frames_np = mono
-            else:
-                self.frames_np = np.concatenate((self.frames_np, mono))
+            self.buffer_chunks.append(mono)
+            self.buffer_samples += len(mono)
+            if voiced:
+                self.last_voice_ts = now
 
-            # Trim the oldest audio when the buffer grows too large
-            if len(self.frames_np) > max_samples:
-                self.frames_offset += self.TRIM_SECS
-                self.frames_np = self.frames_np[trim_samples:]
-                if self.timestamp_offset < self.frames_offset:
-                    self.timestamp_offset = self.frames_offset
+            while self.buffer_samples > max_samples and trim_samples > 0:
+                self._drop_oldest_samples_locked(trim_samples)
 
-    # ------------------------------------------------------------------
-    # Rolling-window transcription worker
-    # ------------------------------------------------------------------
-
-    def _get_unprocessed_chunk(self) -> Optional[np.ndarray]:
-        """Return audio after timestamp_offset, or None if too short."""
+    def _snapshot_unprocessed_chunk(
+        self, min_duration: Optional[float] = None
+    ) -> Optional[Tuple[np.ndarray, float]]:
+        min_secs = self.config.min_chunk_secs if min_duration is None else min_duration
         with self.lock:
-            if self.frames_np is None:
+            if self.buffer_samples == 0:
                 return None
-            start = int(max(0, self.timestamp_offset - self.frames_offset) * self.config.sample_rate)
-            chunk = self.frames_np[start:].copy()
-        if len(chunk) < self.config.sample_rate:  # need at least 1 second
+            start_sec = max(self.timestamp_offset, self.buffer_start_time)
+            start_sample = int(
+                max(0.0, start_sec - self.buffer_start_time) * self.config.sample_rate
+            )
+            full = np.concatenate(list(self.buffer_chunks), axis=0)
+            if start_sample >= len(full):
+                return None
+            chunk = full[start_sample:].copy()
+
+        duration = len(chunk) / float(self.config.sample_rate)
+        if duration < min_secs:
             return None
-        return chunk
+        return chunk, duration
+
+    def _is_paused(self) -> bool:
+        with self.lock:
+            last_voice = self.last_voice_ts
+        if last_voice <= 0:
+            return False
+        return (time.monotonic() - last_voice) >= self.config.pause_silence_secs
+
+    def _advance_timestamp(self, seconds: float) -> None:
+        if seconds <= 0:
+            return
+        with self.lock:
+            self.timestamp_offset += seconds
+            if self.timestamp_offset < self.buffer_start_time:
+                self.timestamp_offset = self.buffer_start_time
+
+    def _type_text(self, text: str) -> None:
+        clean = text.strip()
+        if not clean:
+            return
+        payload = clean if clean.endswith((" ", "\n", "\t")) else f"{clean} "
+        self.keyboard_controller.type(payload)
+        print(f"[transcript] {clean}", flush=True)
+
+    def _process_segments(
+        self,
+        segments: List[dict],
+        duration: float,
+        force_finalize_last: bool,
+    ) -> None:
+        if not segments:
+            return
+
+        confirmed_parts: List[str] = []
+        confirmed_end = 0.0
+
+        for seg in segments[:-1]:
+            seg_end = float(seg.get("end", 0.0))
+            confirmed_end = max(confirmed_end, min(duration, seg_end))
+            if float(seg.get("no_speech_prob", 0.0)) <= self.config.no_speech_thresh:
+                seg_text = (seg.get("text") or "").strip()
+                if seg_text:
+                    confirmed_parts.append(seg_text)
+
+        last = segments[-1]
+        last_end = float(last.get("end", duration))
+        last_end = max(0.0, min(duration, last_end))
+        trailing_silence = max(0.0, duration - last_end)
+        finalize_last = (
+            force_finalize_last
+            or trailing_silence >= self.config.trailing_silence_secs
+        )
+
+        last_text = ""
+        last_no_speech = float(last.get("no_speech_prob", 0.0))
+        if (
+            last_no_speech <= self.config.no_speech_thresh
+            or finalize_last
+        ):
+            last_text = (last.get("text") or "").strip()
+
+        if finalize_last and last_text:
+            confirmed_parts.append(last_text)
+            confirmed_end = max(confirmed_end, last_end)
+            self.prev_out = ""
+            self.same_out_count = 0
+        elif last_text:
+            if last_text == self.prev_out:
+                self.same_out_count += 1
+                if self.same_out_count >= self.config.same_out_limit:
+                    confirmed_parts.append(last_text)
+                    confirmed_end = max(confirmed_end, last_end)
+                    self.prev_out = ""
+                    self.same_out_count = 0
+            else:
+                self.prev_out = last_text
+                self.same_out_count = 0
+        elif (last.get("text") or "").strip():
+            raw_last_text = (last.get("text") or "").strip()
+            if raw_last_text == self.prev_out:
+                self.same_out_count += 1
+                # WhisperLive-like guard for sticky one-word segments.
+                if self.same_out_count >= self.config.same_out_limit + 1:
+                    confirmed_parts.append(raw_last_text)
+                    confirmed_end = max(confirmed_end, last_end)
+                    self.prev_out = ""
+                    self.same_out_count = 0
+            else:
+                self.prev_out = raw_last_text
+                self.same_out_count = 0
+        else:
+            self.prev_out = ""
+            self.same_out_count = 0
+            if finalize_last:
+                confirmed_end = max(confirmed_end, last_end)
+
+        if confirmed_parts:
+            self._type_text(" ".join(confirmed_parts))
+
+        if confirmed_end > 0:
+            self._advance_timestamp(confirmed_end)
+
+    def _transcribe_chunk(self, audio: np.ndarray) -> dict:
+        with self.transcribe_lock:
+            return self.model.transcribe(
+                audio,
+                language=self.config.language,
+                task="transcribe",
+                fp16=False,
+                temperature=0.0,
+                condition_on_previous_text=False,
+                without_timestamps=False,
+            )
 
     def _transcription_worker(self) -> None:
+        next_tick = time.monotonic()
         while not self.stopping.is_set():
             if not self.enabled.is_set():
-                time.sleep(0.1)
+                next_tick = time.monotonic()
+                time.sleep(0.05)
                 continue
 
-            chunk = self._get_unprocessed_chunk()
-            if chunk is None:
-                time.sleep(0.1)
+            now = time.monotonic()
+            if now < next_tick:
+                time.sleep(min(0.05, next_tick - now))
+                continue
+            next_tick = now + self.config.live_interval
+
+            snapshot = self._snapshot_unprocessed_chunk()
+            if snapshot is None:
                 continue
 
+            chunk, duration = snapshot
+            force_finalize_last = self._is_paused()
             try:
-                result = self.model.transcribe(
-                    chunk,
-                    language=self.config.language,
-                    task="transcribe",
-                    fp16=False,
-                    temperature=0.0,
-                    condition_on_previous_text=False,
-                )
-            except Exception as exc:
-                print(f"[error] transcription: {exc}", flush=True)
-                time.sleep(0.1)
+                result = self._transcribe_chunk(chunk)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[error] transcription failed: {exc}", flush=True)
                 continue
 
-            segments = result.get("segments", [])
+            if not self.enabled.is_set():
+                continue
+
+            segments = result.get("segments") or []
             if not segments:
-                time.sleep(0.25)
+                if force_finalize_last:
+                    self._advance_timestamp(duration)
                 continue
 
-            self._process_segments(segments, len(chunk) / self.config.sample_rate)
+            self._process_segments(segments, duration, force_finalize_last)
 
-    def _process_segments(self, segments: list, duration: float) -> None:
-        """
-        Core algorithm from WhisperLive/base.py:
-        - All segments except the last are "complete" — type them and advance offset.
-        - The last segment is "live" (may grow) — hold it until it stabilises.
-        """
-        new_text = ""
-        offset: Optional[float] = None
+    def _flush_remaining(self) -> None:
+        snapshot = self._snapshot_unprocessed_chunk(min_duration=0.15)
+        if snapshot is None:
+            return
 
-        # Complete segments (everything except the last)
-        if len(segments) > 1:
-            last_no_speech = segments[-1].get("no_speech_prob", 0)
-            if last_no_speech <= self.config.no_speech_thresh:
-                for seg in segments[:-1]:
-                    if seg.get("no_speech_prob", 0) <= self.config.no_speech_thresh:
-                        new_text += seg["text"]
-                    offset = min(duration, seg["end"])
+        chunk, duration = snapshot
+        try:
+            result = self._transcribe_chunk(chunk)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[error] final flush failed: {exc}", flush=True)
+            return
 
-        # Live / last segment
-        last = segments[-1]
-        current_out = ""
-        if last.get("no_speech_prob", 0) <= self.config.no_speech_thresh:
-            current_out = last["text"]
+        final_text = (result.get("text") or "").strip()
+        if final_text:
+            self._type_text(final_text)
+        self._advance_timestamp(duration)
 
-        # Same-output guard: if Whisper keeps saying the same thing, confirm it
-        if current_out.strip() and current_out.strip() == self.prev_out.strip():
-            self.same_out_count += 1
-            if self.end_time_for_same_out is None:
-                self.end_time_for_same_out = last["end"]
-
-            if self.same_out_count >= self.config.same_out_limit:
-                new_text += current_out
-                offset = min(duration, self.end_time_for_same_out)
-                self.same_out_count = 0
-                self.end_time_for_same_out = None
-                current_out = ""
-        else:
-            self.same_out_count = 0
-            self.end_time_for_same_out = None
-
-        self.prev_out = current_out
-
-        # Type confirmed text and advance offset
-        if new_text.strip():
-            text = new_text.strip()
-            payload = text if text.endswith((" ", "\n", "\t")) else f"{text} "
-            self.keyboard_controller.type(payload)
-            print(f"[transcript] {text}", flush=True)
-
-        if offset is not None:
-            self.timestamp_offset += offset
-
-    # ------------------------------------------------------------------
-    # Hotkey toggle
-    # ------------------------------------------------------------------
+    def _reset_state(self) -> None:
+        with self.lock:
+            self.buffer_chunks.clear()
+            self.buffer_samples = 0
+            self.buffer_start_time = 0.0
+            self.timestamp_offset = 0.0
+            self.last_voice_ts = 0.0
+        self.prev_out = ""
+        self.same_out_count = 0
 
     def toggle(self) -> None:
         if self.enabled.is_set():
             self.enabled.clear()
-            # Final pass: transcribe whatever is left in the buffer
-            chunk = self._get_unprocessed_chunk()
-            if chunk is not None:
-                try:
-                    result = self.model.transcribe(
-                        chunk, language=self.config.language,
-                        fp16=False, temperature=0.0, condition_on_previous_text=False,
-                    )
-                    text = (result.get("text") or "").strip()
-                    if text and text.strip() != self.prev_out.strip():
-                        payload = text if text.endswith((" ", "\n", "\t")) else f"{text} "
-                        self.keyboard_controller.type(payload)
-                        print(f"[transcript] {text}", flush=True)
-                except Exception as exc:
-                    print(f"[error] final flush: {exc}", flush=True)
-            self._reset()
+            self._flush_remaining()
+            self._reset_state()
             print("[dictation] OFF", flush=True)
-        else:
-            self._reset()
-            self.enabled.set()
-            print("[dictation] ON", flush=True)
+            return
 
-    def _reset(self) -> None:
-        with self.lock:
-            self.frames_np = None
-            self.frames_offset = 0.0
-            self.timestamp_offset = 0.0
-        self.prev_out = ""
-        self.same_out_count = 0
-        self.end_time_for_same_out = None
+        self._reset_state()
+        self.enabled.set()
+        print("[dictation] ON", flush=True)
 
     def stop(self) -> None:
         self.stopping.set()
         self.enabled.clear()
+        self._flush_remaining()
 
     def run(self) -> None:
         self.worker.start()
@@ -301,6 +420,7 @@ class WhisperHotkeyDictation:
             f"[ready] Press {self.config.hotkey} to toggle dictation. Ctrl+C to quit.",
             flush=True,
         )
+
         try:
             with sd.InputStream(
                 samplerate=self.config.sample_rate,
@@ -320,32 +440,94 @@ class WhisperHotkeyDictation:
             self.worker.join(timeout=5.0)
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
 def parse_args() -> DictationConfig:
     default_hotkey = platform_default_hotkey()
     parser = argparse.ArgumentParser(
-        description="Global hotkey dictation using OpenAI Whisper (rolling-window near-realtime)."
+        description="Global hotkey dictation using OpenAI Whisper with rolling near-live transcription."
     )
-    parser.add_argument("--hotkey", default=default_hotkey, type=validate_hotkey,
-                        help=f"Toggle hotkey (default: '{default_hotkey}').")
-    parser.add_argument("--model", default="base",
-                        help="Whisper model: tiny, base, small, medium, large.")
-    parser.add_argument("--language", default=None,
-                        help="Language code, e.g. 'en'. Omit for auto-detect.")
+    parser.add_argument(
+        "--hotkey",
+        default=default_hotkey,
+        type=validate_hotkey,
+        help=f"Toggle hotkey (default on this OS: '{default_hotkey}').",
+    )
+    parser.add_argument(
+        "--model",
+        default="base",
+        help="Whisper model name (tiny, base, small, medium, large).",
+    )
+    parser.add_argument(
+        "--language",
+        default=None,
+        help="Language code, e.g. 'en'. Omit for auto-detect.",
+    )
     parser.add_argument("--sample-rate", type=int, default=16000)
-    parser.add_argument("--block-duration", type=float, default=0.10,
-                        help="Audio callback chunk size in seconds.")
-    parser.add_argument("--no-speech-thresh", type=float, default=0.4,
-                        help="Discard segments with no_speech_prob above this (0-1).")
-    parser.add_argument("--same-out-limit", type=int, default=5,
-                        help="Repeated identical outputs before forcing segment out.")
-    parser.add_argument("--max-buffer-secs", type=float, default=30.0,
-                        help="Rolling buffer max length before trimming old audio.")
-    parser.add_argument("--device", type=int, default=None,
-                        help="Input device index from `python -m sounddevice`.")
+    parser.add_argument(
+        "--block-duration",
+        type=float,
+        default=0.10,
+        help="Audio callback block size in seconds.",
+    )
+    parser.add_argument(
+        "--live-interval",
+        type=float,
+        default=0.35,
+        help="Seconds between rolling transcription passes.",
+    )
+    parser.add_argument(
+        "--min-chunk-secs",
+        type=float,
+        default=0.45,
+        help="Minimum unprocessed audio length before running Whisper.",
+    )
+    parser.add_argument(
+        "--pause-silence-secs",
+        type=float,
+        default=0.30,
+        help="Silence length used to force-flush the current partial segment.",
+    )
+    parser.add_argument(
+        "--trailing-silence-secs",
+        type=float,
+        default=0.20,
+        help="If audio tail after last segment exceeds this, finalize the segment.",
+    )
+    parser.add_argument(
+        "--silence-threshold-db",
+        type=float,
+        default=-36.0,
+        help="Voice threshold in dBFS used for pause detection.",
+    )
+    parser.add_argument(
+        "--no-speech-thresh",
+        type=float,
+        default=0.55,
+        help="Discard segments with no_speech_prob above this.",
+    )
+    parser.add_argument(
+        "--same-out-limit",
+        type=int,
+        default=2,
+        help="Repeated identical partial outputs before confirming them.",
+    )
+    parser.add_argument(
+        "--max-buffer-secs",
+        type=float,
+        default=30.0,
+        help="Maximum rolling buffer size in seconds.",
+    )
+    parser.add_argument(
+        "--trim-secs",
+        type=float,
+        default=6.0,
+        help="Seconds trimmed from the front when buffer exceeds max size.",
+    )
+    parser.add_argument(
+        "--device",
+        type=int,
+        default=None,
+        help="Input device index from `python -m sounddevice`.",
+    )
 
     args = parser.parse_args()
     return DictationConfig(
@@ -354,9 +536,15 @@ def parse_args() -> DictationConfig:
         language=args.language,
         sample_rate=args.sample_rate,
         block_duration=args.block_duration,
+        live_interval=args.live_interval,
+        min_chunk_secs=args.min_chunk_secs,
+        pause_silence_secs=args.pause_silence_secs,
+        trailing_silence_secs=args.trailing_silence_secs,
+        silence_threshold_db=args.silence_threshold_db,
         no_speech_thresh=args.no_speech_thresh,
         same_out_limit=args.same_out_limit,
         max_buffer_secs=args.max_buffer_secs,
+        trim_secs=args.trim_secs,
         device=args.device,
     )
 
