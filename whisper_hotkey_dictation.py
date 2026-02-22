@@ -11,6 +11,8 @@ While dictation is ON:
 from __future__ import annotations
 
 import argparse
+import hashlib
+import os
 import platform
 import threading
 import time
@@ -105,6 +107,9 @@ def platform_default_hotkey() -> str:
 class DictationConfig:
     hotkey: str
     model: str
+    model_cache_dir: Optional[str]
+    offline_strict: bool
+    print_transcripts: bool
     language: Optional[str]
     sample_rate: int
     block_duration: float
@@ -144,9 +149,60 @@ class WhisperHotkeyDictation:
             daemon=True,
         )
 
+        if self.config.offline_strict:
+            self._assert_model_available_offline()
+
         print(f"[model] loading OpenAI Whisper model '{config.model}'...")
-        self.model = whisper.load_model(config.model)
+        self.model = whisper.load_model(
+            config.model,
+            download_root=config.model_cache_dir,
+        )
         print("[model] ready")
+
+    @staticmethod
+    def _default_whisper_cache_dir() -> str:
+        base_cache = os.path.join(os.path.expanduser("~"), ".cache")
+        root = os.getenv("XDG_CACHE_HOME", base_cache)
+        return os.path.join(root, "whisper")
+
+    @staticmethod
+    def _file_sha256(path: str) -> str:
+        digest = hashlib.sha256()
+        with open(path, "rb") as file_obj:
+            for chunk in iter(lambda: file_obj.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _assert_model_available_offline(self) -> None:
+        if os.path.isfile(self.config.model):
+            return
+
+        model_map = getattr(whisper, "_MODELS", {})
+        model_url = model_map.get(self.config.model)
+        if not model_url:
+            raise RuntimeError(
+                "offline strict mode requires either a local model file path or an "
+                f"official whisper model name. received '{self.config.model}'."
+            )
+
+        model_cache_dir = self.config.model_cache_dir or self._default_whisper_cache_dir()
+        expected_sha256 = model_url.split("/")[-2]
+        model_filename = os.path.basename(model_url)
+        cached_model_path = os.path.join(model_cache_dir, model_filename)
+
+        if not os.path.isfile(cached_model_path):
+            raise RuntimeError(
+                "offline strict mode blocked startup: model file not found at "
+                f"'{cached_model_path}'. pre-download it before running."
+            )
+
+        actual_sha256 = self._file_sha256(cached_model_path)
+        if actual_sha256 != expected_sha256:
+            raise RuntimeError(
+                "offline strict mode blocked startup: cached model checksum mismatch "
+                f"for '{cached_model_path}'. expected {expected_sha256}, "
+                f"got {actual_sha256}."
+            )
 
     @staticmethod
     def _chunk_db(chunk: np.ndarray) -> float:
@@ -237,7 +293,8 @@ class WhisperHotkeyDictation:
             return
         payload = clean if clean.endswith((" ", "\n", "\t")) else f"{clean} "
         self.keyboard_controller.type(payload)
-        print(f"[transcript] {clean}", flush=True)
+        if self.config.print_transcripts:
+            print(f"[transcript] {clean}", flush=True)
 
     def _process_segments(
         self,
@@ -457,6 +514,21 @@ def parse_args() -> DictationConfig:
         help="Whisper model name (tiny, base, small, medium, large).",
     )
     parser.add_argument(
+        "--model-cache-dir",
+        default=None,
+        help="Optional Whisper model cache directory (default: ~/.cache/whisper).",
+    )
+    parser.add_argument(
+        "--offline-strict",
+        action="store_true",
+        help="Disallow any model download. Require local cached model with valid checksum.",
+    )
+    parser.add_argument(
+        "--no-console-transcript",
+        action="store_true",
+        help="Do not print recognized text to stdout.",
+    )
+    parser.add_argument(
         "--language",
         default=None,
         help="Language code, e.g. 'en'. Omit for auto-detect.",
@@ -533,6 +605,9 @@ def parse_args() -> DictationConfig:
     return DictationConfig(
         hotkey=args.hotkey,
         model=args.model,
+        model_cache_dir=args.model_cache_dir,
+        offline_strict=args.offline_strict,
+        print_transcripts=not args.no_console_transcript,
         language=args.language,
         sample_rate=args.sample_rate,
         block_duration=args.block_duration,
